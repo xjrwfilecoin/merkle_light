@@ -1,5 +1,5 @@
 use std::fs::{remove_file, File, OpenOptions};
-use std::io::{copy, Seek, SeekFrom};
+use std::io::{copy, Seek, SeekFrom, Read};
 use std::iter::FromIterator;
 use std::marker::PhantomData;
 use std::ops;
@@ -13,13 +13,20 @@ use rayon::iter::*;
 use rayon::prelude::*;
 use tempfile::tempfile;
 use typenum::marker_traits::Unsigned;
-
+use std::sync::Mutex;
 use crate::hash::Algorithm;
 use crate::merkle::{
     get_merkle_tree_cache_size, get_merkle_tree_leafs, get_merkle_tree_len, log2_pow2, next_pow2,
     Element,
 };
 use crate::store::{Store, StoreConfig, StoreConfigDataVersion, BUILD_CHUNK_NODES};
+const io_cache_len:usize = 16 * 1024 * 1024 ;
+#[derive(Debug)]
+struct BufferCache {
+    start:usize,
+    buffer:Vec<u8>,
+}
+
 
 /// The Disk-only store is used to reduce memory to the minimum at the
 /// cost of build time performance. Most of its I/O logic is in the
@@ -40,6 +47,9 @@ pub struct DiskStore<E: Element> {
     // Not to be confused with `len`, this saves the total size of the `store`
     // in bytes and the other one keeps track of used `E` slots in the `DiskStore`.
     store_size: usize,
+
+    cache:Mutex<BufferCache>,
+
 }
 
 impl<E: Element> Store<E> for DiskStore<E> {
@@ -68,6 +78,10 @@ impl<E: Element> Store<E> for DiskStore<E> {
             file,
             loaded_from_disk: false,
             store_size,
+            cache:Mutex::new(BufferCache{
+                start : (0-1) as usize,
+                buffer:Vec::<u8>::with_capacity(io_cache_len)
+            })
         })
     }
 
@@ -83,6 +97,10 @@ impl<E: Element> Store<E> for DiskStore<E> {
             file,
             loaded_from_disk: false,
             store_size,
+            cache:Mutex::new(BufferCache{
+                start : (0-1) as usize,
+                buffer:Vec::<u8>::with_capacity(io_cache_len)
+            })
         })
     }
 
@@ -148,6 +166,10 @@ impl<E: Element> Store<E> for DiskStore<E> {
             file,
             loaded_from_disk: true,
             store_size,
+            cache:Mutex::new(BufferCache{
+                start : (0-1) as usize,
+                buffer:Vec::<u8>::with_capacity(io_cache_len)
+            })
         })
     }
 
@@ -485,34 +507,74 @@ impl<E: Element> DiskStore<E> {
         self.store_size
     }
 
+    fn cache(&self,start:usize,end:usize)->Result<()>{
+        if end-start > io_cache_len {
+            panic!("ooops!  read data is larger than cache:{}",io_cache_len);
+        }
+        let cache_info = &mut self.cache.lock().unwrap();
+        let cached = if cache_info.start == (0-1) as usize {
+            false
+        }else if start >= cache_info.start && end <= cache_info.start + io_cache_len {
+            true
+        }else {
+            false
+        };
+
+        if !cached {
+            let buf = &mut cache_info.buffer;
+            self.file
+                .read_exact_at(start as u64,buf)
+                .with_context(|| {
+                format!(
+                    "failed to read {} bytes from file at offset {}",
+                    end-start, start
+                )
+                })
+        }else{
+            Ok(())
+        }
+
+    }
     pub fn store_read_range(&self, start: usize, end: usize) -> Result<Vec<u8>> {
+
         let read_len = end - start;
         let mut read_data = vec![0; read_len];
 
-        self.file
-            .read_exact_at(start as u64, &mut read_data)
-            .with_context(|| {
-                format!(
-                    "failed to read {} bytes from file at offset {}",
-                    read_len, start
-                )
-            })?;
+        self.cache(start,end)?;
+        let cache_info = &self.cache.lock().unwrap();
+        let cache_start = cache_info.start;
+        let buf = &cache_info.buffer;
+        read_data.clone_from_slice(&buf[start-cache_start..]);
+        // self.file
+        //     .read_exact_at(start as u64, &mut read_data)
+        //     .with_context(|| {
+        //         format!(
+        //             "failed to read {} bytes from file at offset {}",
+        //             read_len, start
+        //         )
+        //     })?;
 
-        ensure!(read_data.len() == read_len, "Failed to read the full range");
+        // ensure!(read_data.len() == read_len, "Failed to read the full range");
 
         Ok(read_data)
     }
 
     pub fn store_read_into(&self, start: usize, end: usize, buf: &mut [u8]) -> Result<()> {
-        self.file
-            .read_exact_at(start as u64, buf)
-            .with_context(|| {
-                format!(
-                    "failed to read {} bytes from file at offset {}",
-                    end - start,
-                    start
-                )
-            })?;
+        self.cache(start,end)?;
+        let cache_info = &self.cache.lock().unwrap();
+        let cache_start = cache_info.start;
+        let cache_buf  = &cache_info.buffer;
+
+        buf[..end-start].clone_from_slice(&cache_buf[start-cache_start..]);
+        // self.file
+        //     .read_exact_at(start as u64, buf)
+        //     .with_context(|| {
+        //         format!(
+        //             "failed to read {} bytes from file at offset {}",
+        //             end - start,
+        //             start
+        //         )
+        //     })?;
 
         Ok(())
     }
