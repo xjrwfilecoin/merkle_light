@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
-use log::debug;
+use log::{debug,trace,error};
 use rayon::prelude::*;
 use typenum::marker_traits::Unsigned;
 use typenum::{U0, U2};
-
+use rayon::ThreadPoolBuilder;
 use crate::hash::{Algorithm, Hashable};
 use crate::proof::Proof;
 use crate::store::{
@@ -1639,18 +1639,18 @@ impl<
             next_pow2(branches) == branches,
             "branches MUST be a power of 2"
         );
-
+        trace!("part 3!");
         let size = get_merkle_tree_len(leafs, branches)?;
         let row_count = get_merkle_tree_row_count(leafs, branches);
 
         let mut data = S::new_with_config(size, branches, config.clone())
             .context("failed to create data store")?;
-
+        trace!("part 2!");
         // If the data store was loaded from disk, we know we have
         // access to the full merkle tree.
         if data.loaded_from_disk() {
             let root = data.last().context("failed to read root")?;
-
+            trace!("loaded from disk!");
             return Ok(MerkleTree {
                 data: Data::BaseTree(data),
                 leafs,
@@ -1664,8 +1664,9 @@ impl<
                 _tta: PhantomData,
             });
         }
-
+        trace!("part 1!");
         populate_data_par::<E, A, S, BaseTreeArity, _>(&mut data, iter)?;
+        trace!("building now!");
         let root = S::build::<A, BaseTreeArity>(&mut data, leafs, row_count, Some(config))?;
 
         Ok(MerkleTree {
@@ -2008,26 +2009,36 @@ where
     if !data.is_empty() {
         return Ok(());
     }
-
+    trace!("populate_data_par 1");
     let store = Arc::new(RwLock::new(data));
+    let pool = ThreadPoolBuilder::new().num_threads(16).build().expect("failed creating pool");
+    pool.install(||{
+        trace!("populate_data_par 2");
+        match iter.chunks(BUILD_DATA_BLOCK_SIZE)
+            .enumerate()
+            .try_for_each(|(index, chunk)| {
+                let mut a = A::default();
+                let mut buf = Vec::with_capacity(BUILD_DATA_BLOCK_SIZE * E::byte_len());
 
-    iter.chunks(BUILD_DATA_BLOCK_SIZE)
-        .enumerate()
-        .try_for_each(|(index, chunk)| {
-            let mut a = A::default();
-            let mut buf = Vec::with_capacity(BUILD_DATA_BLOCK_SIZE * E::byte_len());
+                for item in chunk {
+                    a.reset();
+                    buf.extend(a.leaf(item).as_ref());
+                }
+                store
+                    .write()
+                    .unwrap()
+                    .copy_from_slice(&buf[..], BUILD_DATA_BLOCK_SIZE * index)
+            }) {
+            Ok(_) => {},
+            Err(e) => error!("error in build data {}", e.to_string()),
+        }
+        trace!("populate_data_par 3");
+        match store.write().unwrap().sync() {
+            Ok(_) => {},
+            Err(e) => error!("error in sync data file:{}", e.to_string()),
+        }
+    });
 
-            for item in chunk {
-                a.reset();
-                buf.extend(a.leaf(item).as_ref());
-            }
-            store
-                .write()
-                .unwrap()
-                .copy_from_slice(&buf[..], BUILD_DATA_BLOCK_SIZE * index)
-        })?;
-
-    store.write().unwrap().sync()?;
     Ok(())
 }
 

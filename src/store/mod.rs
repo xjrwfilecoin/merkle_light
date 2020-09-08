@@ -5,7 +5,7 @@ use std::iter::FromIterator;
 use std::ops;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-
+use log::trace;
 use anyhow::Result;
 use positioned_io::ReadAt;
 use rayon::iter::plumbing::*;
@@ -13,7 +13,7 @@ use rayon::iter::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use typenum::marker_traits::Unsigned;
-
+use rayon::ThreadPoolBuilder;
 use crate::hash::Algorithm;
 use crate::merkle::{get_merkle_tree_row_count, log2_pow2, next_pow2, Element};
 
@@ -264,6 +264,7 @@ pub trait Store<E: Element>: std::fmt::Debug + Send + Sync + Sized {
     ) -> Result<E> {
         ensure!(leafs % 2 == 0, "Leafs must be a power of two");
 
+        trace!("small merkle tree ");
         let mut level: usize = 0;
         let mut width = leafs;
         let mut level_node_index = 0;
@@ -322,46 +323,53 @@ pub trait Store<E: Element>: std::fmt::Debug + Send + Sync + Sized {
         // optimized for big sector sizes (small ones will just have one thread doing all
         // the work).
         ensure!(BUILD_CHUNK_NODES % branches == 0, "Invalid chunk size");
-        Vec::from_iter((read_start..read_start + width).step_by(BUILD_CHUNK_NODES))
-            .par_iter()
-            .try_for_each(|&chunk_index| -> Result<()> {
-                let chunk_size = std::cmp::min(BUILD_CHUNK_NODES, read_start + width - chunk_index);
+        trace!("layer is :{}",level);
+        let pool = ThreadPoolBuilder::new().num_threads(16).build().expect("failed creating pool");
+        let result = pool.install(|| {
+            let result = Vec::from_iter((read_start..read_start + width).step_by(BUILD_CHUNK_NODES))
+                .par_iter()
+                .try_for_each(|&chunk_index| -> Result<()> {
+                    let chunk_size = std::cmp::min(BUILD_CHUNK_NODES, read_start + width - chunk_index);
 
-                let chunk_nodes = {
-                    // Read everything taking the lock once.
-                    data_lock
-                        .read()
-                        .unwrap()
-                        .read_range(chunk_index..chunk_index + chunk_size)?
-                };
+                    let chunk_nodes = {
+                        // Read everything taking the lock once.
+                        data_lock
+                            .read()
+                            .unwrap()
+                            .read_range(chunk_index..chunk_index + chunk_size)?
+                    };
 
-                // We write the hashed nodes to the next level in the
-                // position that would be "in the middle" of the
-                // previous pair (dividing by branches).
-                let write_delta = (chunk_index - read_start) / branches;
+                    // We write the hashed nodes to the next level in the
+                    // position that would be "in the middle" of the
+                    // previous pair (dividing by branches).
+                    let write_delta = (chunk_index - read_start) / branches;
 
-                let nodes_size = (chunk_nodes.len() / branches) * E::byte_len();
-                let hashed_nodes_as_bytes = chunk_nodes.chunks(branches).fold(
-                    Vec::with_capacity(nodes_size),
-                    |mut acc, nodes| {
-                        let h = A::default().multi_node(&nodes, level);
-                        acc.extend_from_slice(h.as_ref());
-                        acc
-                    },
-                );
+                    let nodes_size = (chunk_nodes.len() / branches) * E::byte_len();
+                    let hashed_nodes_as_bytes = chunk_nodes.chunks(branches).fold(
+                        Vec::with_capacity(nodes_size),
+                        |mut acc, nodes| {
+                            let h = A::default().multi_node(&nodes, level);
+                            acc.extend_from_slice(h.as_ref());
+                            acc
+                        },
+                    );
 
-                // Check that we correctly pre-allocated the space.
-                ensure!(
+                    // Check that we correctly pre-allocated the space.
+                    ensure!(
                     hashed_nodes_as_bytes.len() == chunk_size / branches * E::byte_len(),
                     "Invalid hashed node length"
                 );
 
-                // Write the data into the store.
-                data_lock
-                    .write()
-                    .unwrap()
-                    .copy_from_slice(&hashed_nodes_as_bytes, write_start + write_delta)
-            })
+                    // Write the data into the store.
+                    data_lock
+                        .write()
+                        .unwrap()
+                        .copy_from_slice(&hashed_nodes_as_bytes, write_start + write_delta)
+                });
+            trace!("layer {} processed", level);
+            result
+        });
+        result
     }
 
     // Default merkle-tree build, based on store type.
@@ -371,6 +379,7 @@ pub trait Store<E: Element>: std::fmt::Debug + Send + Sync + Sized {
         row_count: usize,
         _config: Option<StoreConfig>,
     ) -> Result<E> {
+        trace!("-----------------building-----------------");
         let branches = U::to_usize();
         ensure!(
             next_pow2(branches) == branches,
@@ -378,6 +387,9 @@ pub trait Store<E: Element>: std::fmt::Debug + Send + Sync + Sized {
         );
         ensure!(Store::len(self) == leafs, "Inconsistent data");
         ensure!(leafs % 2 == 0, "Leafs must be a power of two");
+
+
+// let's create a logged pool of threads
 
         if leafs <= SMALL_TREE_BUILD {
             return self.build_small_tree::<A, U>(leafs, row_count);
@@ -393,6 +405,8 @@ pub trait Store<E: Element>: std::fmt::Debug + Send + Sync + Sized {
         let mut width = leafs;
         let mut level_node_index = 0;
         while width > 1 {
+
+            trace!("processing layer {}",level);
             // Start reading at the beginning of the current level, and writing the next
             // level immediate after.  `level_node_index` keeps track of the current read
             // starts, and width is updated accordingly at each level so that we know where
