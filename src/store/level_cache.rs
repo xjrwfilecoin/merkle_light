@@ -440,7 +440,7 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
                 .map_mut(&self.file)
         }?;
         let pool = ThreadPoolBuilder::new().num_threads(16).build().expect("failed creating pool");
-        trace!("building  merkle tree now!");
+        //trace!("building  merkle tree now!");
         pool.install(|| {
             let data_lock = Arc::new(RwLock::new(self));
             let branches = U::to_usize();

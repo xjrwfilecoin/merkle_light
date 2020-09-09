@@ -350,7 +350,7 @@ impl<E: Element> Store<E> for DiskStore<E> {
                 .len(width * E::byte_len())
                 .map_mut(&self.file)
         }?;
-        trace!("building  merkle tree now!");
+        //trace!("building  merkle tree now!");
         let pool = ThreadPoolBuilder::new().num_threads(16).build().expect("failed creating pool");
         pool.install(|| {
             let data_lock = Arc::new(RwLock::new(self));
