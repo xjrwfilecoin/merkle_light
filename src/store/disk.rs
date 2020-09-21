@@ -21,6 +21,7 @@ use crate::merkle::{
 };
 use crate::store::{Store, StoreConfig, StoreConfigDataVersion, BUILD_CHUNK_NODES};
 
+
 /// The Disk-only store is used to reduce memory to the minimum at the
 /// cost of build time performance. Most of its I/O logic is in the
 /// `store_copy_from_slice` and `store_read_range` functions.
@@ -85,7 +86,38 @@ impl<E: Element> Store<E> for DiskStore<E> {
             store_size,
         })
     }
+    fn new_from_multi_buffer_with_config<'a>(
+        size: usize,
+        branches: usize,
+        data:& Vec<(&'a Vec<u8>,usize)>,
+        config: StoreConfig,
+    ) -> Result<Self> {
+        // ensure!(
+        //     data.len() % E::byte_len() == 0,
+        //     "data size must be a multiple of {}",
+        //     E::byte_len()
+        // );
 
+        let mut store = Self::new_with_config(size, branches, config)?;
+
+        // If the store was loaded from disk (based on the config
+        // information, avoid re-populating the store at this point
+        // since it can be assumed by the config that the data is
+        // already correct).
+        if !store.loaded_from_disk {
+            let mut total_len = 0;
+            data.iter().for_each(|(buf,size)|{
+                let val_buf = &buf[..*size];
+                store.store_copy_from_slice(0, val_buf).unwrap();
+                total_len += *size;
+            });
+
+            //store.store_copy_from_slice(0, data)?;
+            store.len = total_len / store.elem_len;
+        }
+
+        Ok(store)
+    }
     fn new_from_slice_with_config(
         size: usize,
         branches: usize,
@@ -351,7 +383,7 @@ impl<E: Element> Store<E> for DiskStore<E> {
                 .map_mut(&self.file)
         }?;
         //trace!("building  merkle tree now!");
-        let pool = ThreadPoolBuilder::new().num_threads(16).build().expect("failed creating pool");
+        let pool = ThreadPoolBuilder::new().num_threads(8).build().expect("failed creating pool");
         pool.install(|| {
             let data_lock = Arc::new(RwLock::new(self));
             let branches = U::to_usize();

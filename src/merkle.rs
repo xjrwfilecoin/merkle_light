@@ -2011,7 +2011,7 @@ where
     }
     trace!("populate_data_par 1");
     let store = Arc::new(RwLock::new(data));
-    let pool = ThreadPoolBuilder::new().num_threads(16).build().expect("failed creating pool");
+    let pool = ThreadPoolBuilder::new().num_threads(8).build().expect("failed creating pool");
     pool.install(||{
         trace!("populate_data_par 2");
         match iter.chunks(BUILD_DATA_BLOCK_SIZE)

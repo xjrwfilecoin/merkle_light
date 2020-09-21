@@ -230,7 +230,14 @@ pub trait Store<E: Element>: std::fmt::Debug + Send + Sync + Sized {
     fn reinit(&mut self) -> Result<()> {
         Ok(())
     }
-
+    fn new_from_multi_buffer_with_config<'a>(
+        size: usize,
+        branches: usize,
+        data:& Vec<(&'a Vec<u8>,usize)>,
+        config: StoreConfig,
+    ) -> Result<Self> {
+        panic!("not implemented")
+    }
     // Removes the store backing (does not require a mutable reference
     // since the config should provide stateless context to what's
     // needed to be removed -- with the exception of in memory stores,
@@ -324,7 +331,7 @@ pub trait Store<E: Element>: std::fmt::Debug + Send + Sync + Sized {
         // the work).
         ensure!(BUILD_CHUNK_NODES % branches == 0, "Invalid chunk size");
         trace!("layer is :{}",level);
-        let pool = ThreadPoolBuilder::new().num_threads(16).build().expect("failed creating pool");
+        let pool = ThreadPoolBuilder::new().num_threads(8).build().expect("failed creating pool");
         let result = pool.install(|| {
             let result = Vec::from_iter((read_start..read_start + width).step_by(BUILD_CHUNK_NODES))
                 .par_iter()
