@@ -108,7 +108,7 @@ impl<E: Element> Store<E> for DiskStore<E> {
             let mut total_len = 0;
             data.iter().for_each(|(buf,size)|{
                 let val_buf = &buf[..*size];
-                store.store_copy_from_slice(0, val_buf).unwrap();
+                store.store_copy_from_slice(total_len, val_buf).unwrap();
                 total_len += *size;
             });
 
