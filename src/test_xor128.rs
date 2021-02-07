@@ -1121,6 +1121,7 @@ fn test_large_tree_disk() {
 
 #[test]
 fn test_mmap_tree() {
+    env_logger::init();
     use std::{thread, time};
 
     let mut a = XOR128::new();
