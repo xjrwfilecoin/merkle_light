@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::ops;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
-use rayon::ThreadPoolBuilder;
+
 use anyhow::{Context, Result};
 use memmap::MmapOptions;
 use positioned_io::{ReadAt, WriteAt};
@@ -439,51 +439,48 @@ impl<E: Element, R: Read + Send + Sync> Store<E> for LevelCacheStore<E, R> {
                 .len(width * E::byte_len())
                 .map_mut(&self.file)
         }?;
-        let pool = ThreadPoolBuilder::new().num_threads(8).build().expect("failed creating pool");
-        //trace!("building  merkle tree now!");
-        pool.install(|| {
-            let data_lock = Arc::new(RwLock::new(self));
-            let branches = U::to_usize();
-            let shift = log2_pow2(branches);
-            let write_chunk_width = (BUILD_CHUNK_NODES >> shift) * E::byte_len();
+        trace!("building  merkle tree now!");
+        let data_lock = Arc::new(RwLock::new(self));
+        let branches = U::to_usize();
+        let shift = log2_pow2(branches);
+        let write_chunk_width = (BUILD_CHUNK_NODES >> shift) * E::byte_len();
 
-            ensure!(BUILD_CHUNK_NODES % branches == 0, "Invalid chunk size");
-            Vec::from_iter((read_start..read_start + width).step_by(BUILD_CHUNK_NODES))
-                .into_par_iter()
-                .zip(mmap.par_chunks_mut(write_chunk_width))
-                .try_for_each(|(chunk_index, write_mmap)| -> Result<()> {
-                    let chunk_size = std::cmp::min(BUILD_CHUNK_NODES, read_start + width - chunk_index);
+        ensure!(BUILD_CHUNK_NODES % branches == 0, "Invalid chunk size");
+        Vec::from_iter((read_start..read_start + width).step_by(BUILD_CHUNK_NODES))
+            .into_par_iter()
+            .zip(mmap.par_chunks_mut(write_chunk_width))
+            .try_for_each(|(chunk_index, write_mmap)| -> Result<()> {
+                let chunk_size = std::cmp::min(BUILD_CHUNK_NODES, read_start + width - chunk_index);
 
-                    let chunk_nodes = {
-                        // Read everything taking the lock once.
-                        data_lock
-                            .read()
-                            .unwrap()
-                            .read_range_internal(chunk_index..chunk_index + chunk_size)?
-                    };
+                let chunk_nodes = {
+                    // Read everything taking the lock once.
+                    data_lock
+                        .read()
+                        .unwrap()
+                        .read_range_internal(chunk_index..chunk_index + chunk_size)?
+                };
 
-                    let nodes_size = (chunk_nodes.len() / branches) * E::byte_len();
-                    let hashed_nodes_as_bytes = chunk_nodes.chunks(branches).fold(
-                        Vec::with_capacity(nodes_size),
-                        |mut acc, nodes| {
-                            let h = A::default().multi_node(&nodes, level);
-                            acc.extend_from_slice(h.as_ref());
-                            acc
-                        },
-                    );
+                let nodes_size = (chunk_nodes.len() / branches) * E::byte_len();
+                let hashed_nodes_as_bytes = chunk_nodes.chunks(branches).fold(
+                    Vec::with_capacity(nodes_size),
+                    |mut acc, nodes| {
+                        let h = A::default().multi_node(&nodes, level);
+                        acc.extend_from_slice(h.as_ref());
+                        acc
+                    },
+                );
 
-                    // Check that we correctly pre-allocated the space.
-                    let hashed_nodes_as_bytes_len = hashed_nodes_as_bytes.len();
-                    ensure!(
+                // Check that we correctly pre-allocated the space.
+                let hashed_nodes_as_bytes_len = hashed_nodes_as_bytes.len();
+                ensure!(
                     hashed_nodes_as_bytes.len() == chunk_size / branches * E::byte_len(),
                     "Invalid hashed node length"
                 );
 
-                    write_mmap[0..hashed_nodes_as_bytes_len].copy_from_slice(&hashed_nodes_as_bytes);
+                write_mmap[0..hashed_nodes_as_bytes_len].copy_from_slice(&hashed_nodes_as_bytes);
 
-                    Ok(())
-                })
-        })
+                Ok(())
+            })
     }
 
     // LevelCacheStore specific merkle-tree build.

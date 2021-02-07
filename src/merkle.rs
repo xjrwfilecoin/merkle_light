@@ -7,7 +7,7 @@ use log::{debug,trace,error};
 use rayon::prelude::*;
 use typenum::marker_traits::Unsigned;
 use typenum::{U0, U2};
-use rayon::ThreadPoolBuilder;
+
 use crate::hash::{Algorithm, Hashable};
 use crate::proof::Proof;
 use crate::store::{
@@ -2011,34 +2011,24 @@ where
     }
     trace!("populate_data_par 1");
     let store = Arc::new(RwLock::new(data));
-    let pool = ThreadPoolBuilder::new().num_threads(8).build().expect("failed creating pool");
-    pool.install(||{
-        trace!("populate_data_par 2");
-        match iter.chunks(BUILD_DATA_BLOCK_SIZE)
-            .enumerate()
-            .try_for_each(|(index, chunk)| {
-                let mut a = A::default();
-                let mut buf = Vec::with_capacity(BUILD_DATA_BLOCK_SIZE * E::byte_len());
 
-                for item in chunk {
-                    a.reset();
-                    buf.extend(a.leaf(item).as_ref());
-                }
-                store
-                    .write()
-                    .unwrap()
-                    .copy_from_slice(&buf[..], BUILD_DATA_BLOCK_SIZE * index)
-            }) {
-            Ok(_) => {},
-            Err(e) => error!("error in build data {}", e.to_string()),
-        }
-        trace!("populate_data_par 3");
-        match store.write().unwrap().sync() {
-            Ok(_) => {},
-            Err(e) => error!("error in sync data file:{}", e.to_string()),
-        }
-    });
+    iter.chunks(BUILD_DATA_BLOCK_SIZE)
+        .enumerate()
+        .try_for_each(|(index, chunk)| {
+            let mut a = A::default();
+            let mut buf = Vec::with_capacity(BUILD_DATA_BLOCK_SIZE * E::byte_len());
 
+            for item in chunk {
+                a.reset();
+                buf.extend(a.leaf(item).as_ref());
+            }
+            store
+                .write()
+                .unwrap()
+                .copy_from_slice(&buf[..], BUILD_DATA_BLOCK_SIZE * index)
+        })?;
+
+    store.write().unwrap().sync()?;
     Ok(())
 }
 
