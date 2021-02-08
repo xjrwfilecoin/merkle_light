@@ -21,7 +21,6 @@ use crate::merkle::{
 };
 use crate::store::{Store, StoreConfig, StoreConfigDataVersion, BUILD_CHUNK_NODES};
 
-
 /// The Disk-only store is used to reduce memory to the minimum at the
 /// cost of build time performance. Most of its I/O logic is in the
 /// `store_copy_from_slice` and `store_read_range` functions.

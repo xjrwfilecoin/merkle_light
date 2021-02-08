@@ -1289,18 +1289,23 @@ impl<
         );
 
         lemma.push(self.read_at(j)?);
+        let mut data_copy: Vec<E> = Vec::new();
+        data_copy.reserve(branches);
         while base + 1 < self.len() {
             let hash_index = (j / branches) * branches;
+            let read_start = base + hash_index;
+            let read_end = base + hash_index + branches;
+            if read_start < data_width || read_start >= cache_index_start {
+                data_copy = self.read_tree_range(read_start, read_end)?
+            } else {
+                let read_start = partial_base + hash_index - segment_shift;
+                let read_end = partial_base + hash_index + branches - segment_shift;
+                data_copy = partial_tree.read_tree_range(read_start, read_end)?
+            }
             for k in hash_index..hash_index + branches {
                 if k != j {
-                    let read_index = base + k;
                     lemma.push(
-                        if read_index < data_width || read_index >= cache_index_start {
-                            self.read_at(base + k)?
-                        } else {
-                            let read_index = partial_base + k - segment_shift;
-                            partial_tree.read_at(read_index)?
-                        },
+                        data_copy[k - hash_index].clone(),
                     );
                 }
             }
@@ -1446,6 +1451,49 @@ impl<
             Data::BaseTree(data) => {
                 // Read from the base layer tree data.
                 data.read_at(i)
+            }
+        }
+    }
+
+    // Returns merkle leaf range from start to end
+    #[inline]
+    pub fn read_tree_range(&self, start: usize, end: usize) -> Result<Vec<E>> {
+        match &self.data {
+            Data::TopTree(sub_trees) => {
+                // Locate the top-layer tree the sub-tree leaf is contained in.
+                ensure!(
+                    TopTreeArity::to_usize() == sub_trees.len(),
+                    "Top layer tree shape mis-match"
+                );
+                let tree_index = start / (self.leafs / TopTreeArity::to_usize());
+                let tree = &sub_trees[tree_index];
+                let tree_leafs = tree.leafs();
+
+                // Get the leaf start and end within the sub-tree.
+                let leaf_start = start % tree_leafs;
+                let leaf_end = end % tree_leafs;
+
+                tree.read_tree_range(leaf_start, leaf_end)
+            }
+            Data::SubTree(base_trees) => {
+                // Locate the sub-tree layer tree the base leaf is contained in.
+                ensure!(
+                    SubTreeArity::to_usize() == base_trees.len(),
+                    "Sub-tree shape mis-match"
+                );
+                let tree_index = start / (self.leafs / SubTreeArity::to_usize());
+                let tree = &base_trees[tree_index];
+                let tree_leafs = tree.leafs();
+
+                // Get the leaf start and end within the sub-tree.
+                let leaf_start = start % tree_leafs;
+                let leaf_end = end % tree_leafs;
+
+                tree.read_tree_range(leaf_start, leaf_end)
+            }
+            Data::BaseTree(data) => {
+                // Read from the base layer tree data.
+                data.read_range(start..end)
             }
         }
     }
