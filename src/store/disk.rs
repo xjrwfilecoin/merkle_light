@@ -1,5 +1,5 @@
 use std::fs::{remove_file, File, OpenOptions};
-use std::io::{copy, Seek, SeekFrom};
+use std::io::{copy, Seek, SeekFrom, IoSliceMut, IoSlice};
 use std::iter::FromIterator;
 use std::marker::PhantomData;
 use std::ops;
@@ -15,6 +15,11 @@ use tempfile::tempfile;
 use typenum::marker_traits::Unsigned;
 use log::trace;
 use crate::hash::Algorithm;
+#[cfg(feature = "io")]
+use uring::{SubmissionQueue,CompletionQueue};
+#[cfg(feature = "io")]
+use std::os::unix::io::AsRawFd;
+
 use crate::merkle::{
     get_merkle_tree_cache_size, get_merkle_tree_leafs, get_merkle_tree_len, log2_pow2, next_pow2,
     Element,
@@ -61,6 +66,7 @@ impl<E: Element> Store<E> for DiskStore<E> {
         let store_size = E::byte_len() * size;
         file.set_len(store_size as u64)?;
         trace!("store 4");
+
         Ok(DiskStore {
             len: 0,
             elem_len: E::byte_len(),
@@ -75,7 +81,6 @@ impl<E: Element> Store<E> for DiskStore<E> {
         let store_size = E::byte_len() * size;
         let file = tempfile()?;
         file.set_len(store_size as u64)?;
-
         Ok(DiskStore {
             len: 0,
             elem_len: E::byte_len(),
@@ -140,7 +145,6 @@ impl<E: Element> Store<E> for DiskStore<E> {
             size * E::byte_len(),
             store_size
         );
-
         Ok(DiskStore {
             len: size,
             elem_len: E::byte_len(),
@@ -265,7 +269,6 @@ impl<E: Element> Store<E> for DiskStore<E> {
         let mut reader = OpenOptions::new()
             .read(true)
             .open(StoreConfig::data_path(&config.path, &config.id))?;
-        reader.seek(SeekFrom::Start(cache_start as u64))?;
 
         // Make sure the store file is opened for read/write.
         self.file = OpenOptions::new()
@@ -273,12 +276,52 @@ impl<E: Element> Store<E> for DiskStore<E> {
             .write(true)
             .open(StoreConfig::data_path(&config.path, &config.id))?;
 
-        // Seek the writer.
-        self.file.seek(SeekFrom::Start(start))?;
+        #[cfg(not(feature = "io"))]
+        {
+            reader.seek(SeekFrom::Start(cache_start as u64))?;
+            // Seek the writer.
+            self.file.seek(SeekFrom::Start(start))?;
+        }
+        #[cfg(feature = "io")]
+        {
+            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+            let mut len = 0;
+            let src_fd = reader.as_raw_fd();
+            let dest_fd = self.file.as_raw_fd();
+            while len < cache_size {
+                let mut read_buf = [0; 256 * 1024];
+                let mut read_bufs = [IoSliceMut::new(&mut read_buf)];
+
+                let sqe = sq.next_sqe().unwrap();
+                sqe.offset = cache_start as u64 + len as u64;
+                sqe.prep_read_vectored(src_fd, &mut read_bufs);
+
+                sq.submit_sqe();
+
+                cq.wait_for_cqe()?;
+                let cqe = cq.next_cqe().unwrap();
+
+                let item = &read_buf[..cqe.res as usize];
+
+                let write_bufs = [IoSlice::new(item)];
+
+                let sqe = sq.next_sqe().unwrap();
+                sqe.offset = start + len as u64;
+                sqe.prep_write_vectored(dest_fd, &write_bufs);
+                sq.submit_sqe();
+                cq.wait_for_cqe()?;
+                let cqe = cq.next_cqe().unwrap();
+                len += cqe.res as usize;
+            }
+        }
+
 
         // Copy the data from the cached region to the writer.
-        let written = copy(&mut reader, &mut self.file)?;
-        ensure!(written == cache_size as u64, "Failed to copy all data");
+        #[cfg(not(feature = "io"))]
+        {
+            let written = copy(&mut reader, &mut self.file)?;
+            ensure!(written == cache_size as u64, "Failed to copy all data");
+        }
         if v1 {
             // Truncate the data on-disk to be the base layer data
             // followed by the cached data.
@@ -296,7 +339,9 @@ impl<E: Element> Store<E> for DiskStore<E> {
 
         // Sync and sanity check that we match on disk (this can be
         // removed if needed).
+        // #[cfg(not(feature = "io"))]
         self.sync()?;
+
         let metadata = self.file.metadata()?;
         let store_size = metadata.len() as usize;
         ensure!(
@@ -488,31 +533,68 @@ impl<E: Element> DiskStore<E> {
     pub fn store_read_range(&self, start: usize, end: usize) -> Result<Vec<u8>> {
         let read_len = end - start;
         let mut read_data = vec![0; read_len];
+        #[cfg(feature = "io")]
+        {
+            let src_fd = self.file.as_raw_fd();
+            let mut read_bufs = [IoSliceMut::new(&mut read_data)];
+            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+            let sqe = sq.next_sqe().unwrap();
+            sqe.offset = start as u64;
+            sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-        self.file
-            .read_exact_at(start as u64, &mut read_data)
-            .with_context(|| {
-                format!(
-                    "failed to read {} bytes from file at offset {}",
-                    read_len, start
-                )
-            })?;
+            sq.submit_sqe();
 
-        ensure!(read_data.len() == read_len, "Failed to read the full range");
+            cq.wait_for_cqe()?;
+            let cqe = cq.next_cqe().unwrap();
+            ensure!(cqe.res as usize == read_len, "Failed to read the full range");
+        }
+
+        #[cfg(not(feature = "io"))]
+        {
+            self.file
+                .read_exact_at(start as u64, &mut read_data)
+                .with_context(|| {
+                    format!(
+                        "failed to read {} bytes from file at offset {}",
+                        read_len, start
+                    )
+                })?;
+
+            ensure!(read_data.len() == read_len, "Failed to read the full range");
+        }
 
         Ok(read_data)
     }
 
     pub fn store_read_into(&self, start: usize, end: usize, buf: &mut [u8]) -> Result<()> {
-        self.file
-            .read_exact_at(start as u64, buf)
-            .with_context(|| {
-                format!(
-                    "failed to read {} bytes from file at offset {}",
-                    end - start,
-                    start
-                )
-            })?;
+        #[cfg(feature = "io")]
+        {
+            let src_fd = self.file.as_raw_fd();
+            let mut read_bufs = [IoSliceMut::new(buf)];
+            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+            let sqe = sq.next_sqe().unwrap();
+            sqe.offset = start as u64;
+            sqe.prep_read_vectored(src_fd, &mut read_bufs);
+
+            sq.submit_sqe();
+
+            cq.wait_for_cqe()?;
+            let cqe = cq.next_cqe().unwrap();
+            ensure!(cqe.res as usize == buf.len(), "Failed to read the full range");
+        }
+
+        #[cfg(not(feature = "io"))]
+        {
+            self.file
+                .read_exact_at(start as u64, buf)
+                .with_context(|| {
+                    format!(
+                        "failed to read {} bytes from file at offset {}",
+                        end - start,
+                        start
+                    )
+                })?;
+        }
 
         Ok(())
     }
@@ -523,6 +605,23 @@ impl<E: Element> DiskStore<E> {
             "Requested slice too large (max: {})",
             self.store_size
         );
+        #[cfg(feature = "io")]
+        {
+            let write_bufs = [IoSlice::new(slice)];
+            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+            let sqe = sq.next_sqe().unwrap();
+            sqe.offset = start as u64;
+
+            let dest_fd = self.file.as_raw_fd();
+
+            sqe.prep_write_vectored(dest_fd, &write_bufs);
+            sq.submit_sqe();
+            cq.wait_for_cqe()?;
+            let cqe = cq.next_cqe().unwrap();
+            ensure!(cqe.res as usize == slice.len(), "Failed to write all at");
+        }
+
+        #[cfg(not(feature = "io"))]
         self.file.write_all_at(start as u64, slice)?;
 
         Ok(())

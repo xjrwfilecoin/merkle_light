@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs::{remove_file, File, OpenOptions};
-use std::io::{copy, Read, Seek, SeekFrom};
+use std::io::{copy, Read, Seek, SeekFrom, IoSlice, IoSliceMut};
 use std::iter::FromIterator;
 use std::marker::PhantomData;
 use std::ops;
@@ -16,6 +16,12 @@ use tempfile::tempfile;
 use typenum::marker_traits::Unsigned;
 use log::trace;
 use crate::hash::Algorithm;
+
+#[cfg(feature = "io")]
+use uring::{SubmissionQueue,CompletionQueue};
+#[cfg(feature = "io")]
+use std::os::unix::io::AsRawFd;
+
 use crate::merkle::{
     get_merkle_tree_cache_size, get_merkle_tree_leafs, get_merkle_tree_len, log2_pow2, next_pow2,
     Element,
@@ -587,7 +593,6 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         let mut reader = OpenOptions::new()
             .read(true)
             .open(StoreConfig::data_path(&config.path, &config.id))?;
-        reader.seek(SeekFrom::Start(len))?;
 
         // Make sure the store file is opened for read/write.
         self.file = OpenOptions::new()
@@ -595,13 +600,53 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
             .write(true)
             .open(StoreConfig::data_path(&config.path, &config.id))?;
 
-        // Seek the writer.
-        self.file.seek(SeekFrom::Start(0))?;
+        #[cfg(not(feature = "io"))]
+        {
+            reader.seek(SeekFrom::Start(len))?;
+            // Seek the writer.
+            self.file.seek(SeekFrom::Start(0))?;
+        }
+        #[cfg(feature = "io")]
+        {
+            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+            let mut written = 0;
+            let src_fd = reader.as_raw_fd();
+            let dest_fd = self.file.as_raw_fd();
+            while written < store_size - len {
+                let mut read_buf = [0; 256 * 1024];
+                let mut read_bufs = [IoSliceMut::new(&mut read_buf)];
 
-        let written = copy(&mut reader, &mut self.file)?;
-        ensure!(written == store_size - len, "Failed to copy all data");
+                let sqe = sq.next_sqe().unwrap();
+                sqe.offset = len + written as u64;
+                sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-        self.file.set_len(written)?;
+                sq.submit_sqe();
+
+                cq.wait_for_cqe()?;
+                let cqe = cq.next_cqe().unwrap();
+
+                let item = &read_buf[..cqe.res as usize];
+
+                let write_bufs = [IoSlice::new(item)];
+
+                let sqe = sq.next_sqe().unwrap();
+                sqe.offset = written as u64;
+                sqe.prep_write_vectored(dest_fd, &write_bufs);
+                sq.submit_sqe();
+                cq.wait_for_cqe()?;
+                let cqe = cq.next_cqe().unwrap();
+                written += cqe.res as usize;
+            }
+            self.file.set_len(written)?;
+        }
+
+        // Copy the data from the cached region to the writer.
+        #[cfg(not(feature = "io"))]
+        {
+            let written = copy(&mut reader, &mut self.file)?;
+            ensure!(written == store_size - len, "Failed to copy all data");
+            self.file.set_len(written)?;
+        }
 
         Ok(())
     }
@@ -690,17 +735,35 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
 
         // If an external reader was specified for the base layer, use it.
         if start < self.data_width * self.elem_len && self.reader.is_some() {
-            self.reader
-                .as_ref()
-                .unwrap()
-                .read(start, end, &mut read_data)
-                .with_context(|| {
-                    format!(
-                        "failed to read {} bytes from file at offset {}",
-                        end - start,
-                        start
-                    )
-                })?;
+            #[cfg(feature = "io")]
+            {
+                let src_fd = self.reader.as_raw_fd();
+                let mut read_bufs = [IoSliceMut::new(&mut read_data)];
+                let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+                let sqe = sq.next_sqe().unwrap();
+                sqe.offset = start as u64;
+                sqe.prep_read_vectored(src_fd, &mut read_bufs);
+
+                sq.submit_sqe();
+
+                cq.wait_for_cqe()?;
+                let cqe = cq.next_cqe().unwrap();
+                ensure!(cqe.res as usize == read_len, "Failed to read at offset");
+            }
+            #[cfg(not(feature = "io"))]
+            {
+                self.reader
+                    .as_ref()
+                    .unwrap()
+                    .read(start, end, &mut read_data)
+                    .with_context(|| {
+                        format!(
+                            "failed to read {} bytes from file at offset {}",
+                            end - start,
+                            start
+                        )
+                    })?;
+            }
 
             return Ok(read_data);
         }
@@ -715,15 +778,32 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
                 start - self.cache_index_start
             };
         }
+        #[cfg(feature = "io")]
+        {
+            let src_fd = self.file.as_raw_fd();
+            let mut read_bufs = [IoSliceMut::new(&mut read_data)];
+            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+            let sqe = sq.next_sqe().unwrap();
+            sqe.offset = adjusted_start as u64;
+            sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-        self.file
-            .read_exact_at(adjusted_start as u64, &mut read_data)
-            .with_context(|| {
-                format!(
-                    "failed to read {} bytes from file at offset {}",
-                    read_len, start
-                )
-            })?;
+            sq.submit_sqe();
+
+            cq.wait_for_cqe()?;
+            let cqe = cq.next_cqe().unwrap();
+            ensure!(cqe.res as usize == read_len, "Failed to read at offset");
+        }
+        #[cfg(not(feature = "io"))]
+        {
+            self.file
+                .read_exact_at(adjusted_start as u64, &mut read_data)
+                .with_context(|| {
+                    format!(
+                        "failed to read {} bytes from file at offset {}",
+                        read_len, start
+                    )
+                })?;
+        }
 
         Ok(read_data)
     }
@@ -737,15 +817,32 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
             start <= self.data_width * self.elem_len || start >= self.cache_index_start,
             "out of bounds"
         );
+        #[cfg(feature = "io")]
+        {
+            let src_fd = self.file.as_raw_fd();
+            let mut read_bufs = [IoSliceMut::new(&mut read_data)];
+            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+            let sqe = sq.next_sqe().unwrap();
+            sqe.offset = start as u64;
+            sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-        self.file
-            .read_exact_at(start as u64, &mut read_data)
-            .with_context(|| {
-                format!(
-                    "failed to read {} bytes from file at offset {}",
-                    read_len, start
-                )
-            })?;
+            sq.submit_sqe();
+
+            cq.wait_for_cqe()?;
+            let cqe = cq.next_cqe().unwrap();
+            ensure!(cqe.res as usize == read_len, "Failed to read range");
+        }
+        #[cfg(not(feature = "io"))]
+        {
+            self.file
+                .read_exact_at(start as u64, &mut read_data)
+                .with_context(|| {
+                    format!(
+                        "failed to read {} bytes from file at offset {}",
+                        read_len, start
+                    )
+                })?;
+        }
 
         Ok(read_data)
     }
@@ -792,17 +889,36 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
 
         // If an external reader was specified for the base layer, use it.
         if start < self.data_width * self.elem_len && self.reader.is_some() {
-            self.reader
-                .as_ref()
-                .unwrap()
-                .read(start, end, buf)
-                .with_context(|| {
-                    format!(
-                        "failed to read {} bytes from file at offset {}",
-                        end - start,
-                        start
-                    )
-                })?;
+            #[cfg(feature = "io")]
+            {
+                let src_fd = self.reader.as_raw_fd();
+                let mut read_bufs = [IoSliceMut::new(buf)];
+                let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+                let sqe = sq.next_sqe().unwrap();
+                sqe.offset = start as u64;
+                sqe.prep_read_vectored(src_fd, &mut read_bufs);
+
+                sq.submit_sqe();
+
+                cq.wait_for_cqe()?;
+                let cqe = cq.next_cqe().unwrap();
+                ensure!(cqe.res as usize == buf.len(), "Failed to read into");
+            }
+            #[cfg(not(feature = "io"))]
+            {
+                self.reader
+                    .as_ref()
+                    .unwrap()
+                    .read(start, end, buf)
+                    .with_context(|| {
+                        format!(
+                            "failed to read {} bytes from file at offset {}",
+                            end - start,
+                            start
+                        )
+                    })?;
+            }
+
         } else {
             // Adjust read index if in the cached ranged to be shifted
             // over since the data stored is compacted.
@@ -816,16 +932,33 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
             } else {
                 start
             };
+            #[cfg(feature = "io")]
+            {
+                let src_fd = self.file.as_raw_fd();
+                let mut read_bufs = [IoSliceMut::new(buf)];
+                let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+                let sqe = sq.next_sqe().unwrap();
+                sqe.offset = adjusted_start as u64;
+                sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-            self.file
-                .read_exact_at(adjusted_start as u64, buf)
-                .with_context(|| {
-                    format!(
-                        "failed to read {} bytes from file at offset {}",
-                        end - start,
-                        start
-                    )
-                })?;
+                sq.submit_sqe();
+
+                cq.wait_for_cqe()?;
+                let cqe = cq.next_cqe().unwrap();
+                ensure!(cqe.res as usize == buf.len(), "Failed to read into");
+            }
+            #[cfg(not(feature = "io"))]
+            {
+                self.file
+                    .read_exact_at(adjusted_start as u64, buf)
+                    .with_context(|| {
+                        format!(
+                            "failed to read {} bytes from file at offset {}",
+                            end - start,
+                            start
+                        )
+                    })?;
+            }
         }
 
         Ok(())
@@ -837,7 +970,27 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
             "Requested slice too large (max: {})",
             self.store_size
         );
-        self.file.write_all_at(start as u64, slice)?;
+
+        #[cfg(feature = "io")]
+        {
+            let write_bufs = [IoSlice::new(slice)];
+            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+            let sqe = sq.next_sqe().unwrap();
+            sqe.offset = start as u64;
+
+            let dest_fd = self.file.as_raw_fd();
+
+            sqe.prep_write_vectored(dest_fd, &write_bufs);
+            sq.submit_sqe();
+            cq.wait_for_cqe()?;
+            let cqe = cq.next_cqe().unwrap();
+            ensure!(cqe.res as usize == slice.len(), "Failed to write all at");
+        }
+
+        #[cfg(not(feature = "io"))]
+        {
+            self.file.write_all_at(start as u64, slice)?;
+        }
 
         Ok(())
     }
