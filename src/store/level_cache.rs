@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use memmap::MmapOptions;
+#[cfg(feature = "positioned")]
 use positioned_io::{ReadAt, WriteAt};
 use rayon::iter::*;
 use rayon::prelude::*;

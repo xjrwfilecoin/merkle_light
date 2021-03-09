@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use log::trace;
 use anyhow::Result;
+
+#[cfg(feature = "positioned")]
 use positioned_io::ReadAt;
 use rayon::iter::plumbing::*;
 use rayon::iter::*;
