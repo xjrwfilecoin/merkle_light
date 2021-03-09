@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{Read, IoSliceMut};
 use std::iter::FromIterator;
 use std::ops;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,8 @@ use rayon::iter::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use typenum::marker_traits::Unsigned;
-
+#[cfg(feature = "io")]
+use std::os::unix::io::AsRawFd;
 use crate::hash::Algorithm;
 use crate::merkle::{get_merkle_tree_row_count, log2_pow2, next_pow2, Element};
 
@@ -59,7 +60,25 @@ impl ExternalReader<std::fs::File> {
             offset: replica_config.offsets[index],
             source: reader,
             read_fn: |start, end, buf: &mut [u8], reader: &std::fs::File| {
-                reader.read_exact_at(start as u64, &mut buf[0..end - start])?;
+                #[cfg(feature = "io")]
+                {
+                    let src_fd = reader.as_raw_fd();
+                    let mut read_bufs = [IoSliceMut::new(&mut buf[0..end - start])];
+                    let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+                    let sqe = sq.next_sqe().unwrap();
+                    sqe.offset = start as u64;
+                    sqe.prep_read_vectored(src_fd, &mut read_bufs);
+
+                    sq.submit_sqe();
+
+                    cq.wait_for_cqe()?;
+                    let cqe = cq.next_cqe().unwrap();
+                    ensure!(cqe.res as usize == end - start, "Failed to read the full range");
+                }
+                #[cfg(not(feature = "io"))]
+                {
+                    reader.read_exact_at(start as u64, &mut buf[0..end - start])?;
+                }
 
                 Ok(end - start)
             },

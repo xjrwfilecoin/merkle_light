@@ -30,7 +30,7 @@ rand = "0.7.3"
 arrayref = "0.3.5"
 tempdir = "0.3.7"
 tempfile = "3.0.7"
-positioned-io = "0.2"
+positioned-io = { version = "^0.2", optional = true }
 log = "0.4.7"
 serde = { version = "1.0", features = ["derive"]}
 anyhow = "1.0.23"
@@ -47,3 +47,5 @@ bitcoin = ["ring", "rust-crypto"]
 chaincore = ["rust-crypto"]
 crypto_bench = ["rust-crypto", "ring"]
 io = ["uring"]
+positioned = ["positioned-io"]
+
