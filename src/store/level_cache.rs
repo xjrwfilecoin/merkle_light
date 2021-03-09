@@ -600,9 +600,10 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
             .write(true)
             .open(StoreConfig::data_path(&config.path, &config.id))?;
 
+        reader.seek(SeekFrom::Start(len))?;
+
         #[cfg(not(feature = "io"))]
         {
-            reader.seek(SeekFrom::Start(len))?;
             // Seek the writer.
             self.file.seek(SeekFrom::Start(0))?;
         }
@@ -610,32 +611,19 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         {
             let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
             let mut written = 0;
-            let src_fd = reader.as_raw_fd();
             let dest_fd = self.file.as_raw_fd();
             while written < store_size - len {
                 let mut read_buf = [0; 256 * 1024];
-                let mut read_bufs = [IoSliceMut::new(&mut read_buf)];
-
-                let sqe = sq.next_sqe().unwrap();
-                sqe.offset = len + written as u64;
-                sqe.prep_read_vectored(src_fd, &mut read_bufs);
-
-                sq.submit_sqe();
-
-                cq.wait_for_cqe()?;
-                let cqe = cq.next_cqe().unwrap();
-
-                let item = &read_buf[..cqe.res as usize];
-
+                let len = reader.read(&mut read_buf)?;
+                let item = &read_buf[..len];
                 let write_bufs = [IoSlice::new(item)];
-
                 let sqe = sq.next_sqe().unwrap();
-                sqe.offset = written as u64;
+                sqe.offset = written;
                 sqe.prep_write_vectored(dest_fd, &write_bufs);
                 sq.submit_sqe();
                 cq.wait_for_cqe()?;
                 let cqe = cq.next_cqe().unwrap();
-                written += cqe.res as usize;
+                written += cqe.res as u64;
             }
             self.file.set_len(written)?;
         }
@@ -735,35 +723,17 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
 
         // If an external reader was specified for the base layer, use it.
         if start < self.data_width * self.elem_len && self.reader.is_some() {
-            #[cfg(feature = "io")]
-            {
-                let src_fd = self.reader.as_raw_fd();
-                let mut read_bufs = [IoSliceMut::new(&mut read_data)];
-                let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
-                let sqe = sq.next_sqe().unwrap();
-                sqe.offset = start as u64;
-                sqe.prep_read_vectored(src_fd, &mut read_bufs);
-
-                sq.submit_sqe();
-
-                cq.wait_for_cqe()?;
-                let cqe = cq.next_cqe().unwrap();
-                ensure!(cqe.res as usize == read_len, "Failed to read at offset");
-            }
-            #[cfg(not(feature = "io"))]
-            {
-                self.reader
-                    .as_ref()
-                    .unwrap()
-                    .read(start, end, &mut read_data)
-                    .with_context(|| {
-                        format!(
-                            "failed to read {} bytes from file at offset {}",
-                            end - start,
-                            start
-                        )
-                    })?;
-            }
+            self.reader
+                .as_ref()
+                .unwrap()
+                .read(start, end, &mut read_data)
+                .with_context(|| {
+                    format!(
+                        "failed to read {} bytes from file at offset {}",
+                        end - start,
+                        start
+                    )
+                })?;
 
             return Ok(read_data);
         }
@@ -889,35 +859,18 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
 
         // If an external reader was specified for the base layer, use it.
         if start < self.data_width * self.elem_len && self.reader.is_some() {
-            #[cfg(feature = "io")]
-            {
-                let src_fd = self.reader.as_raw_fd();
-                let mut read_bufs = [IoSliceMut::new(buf)];
-                let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
-                let sqe = sq.next_sqe().unwrap();
-                sqe.offset = start as u64;
-                sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-                sq.submit_sqe();
-
-                cq.wait_for_cqe()?;
-                let cqe = cq.next_cqe().unwrap();
-                ensure!(cqe.res as usize == buf.len(), "Failed to read into");
-            }
-            #[cfg(not(feature = "io"))]
-            {
-                self.reader
-                    .as_ref()
-                    .unwrap()
-                    .read(start, end, buf)
-                    .with_context(|| {
-                        format!(
-                            "failed to read {} bytes from file at offset {}",
-                            end - start,
-                            start
-                        )
-                    })?;
-            }
+            self.reader
+                .as_ref()
+                .unwrap()
+                .read(start, end, buf)
+                .with_context(|| {
+                    format!(
+                        "failed to read {} bytes from file at offset {}",
+                        end - start,
+                        start
+                    )
+                })?;
 
         } else {
             // Adjust read index if in the cached ranged to be shifted
