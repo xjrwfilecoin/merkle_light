@@ -65,17 +65,22 @@ impl ExternalReader<std::fs::File> {
                 #[cfg(feature = "io")]
                 {
                     let src_fd = reader.as_raw_fd();
-                    let mut read_bufs = [IoSliceMut::new(&mut buf[0..end - start])];
-                    let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
-                    let sqe = sq.next_sqe().unwrap();
-                    sqe.offset = start as u64;
-                    sqe.prep_read_vectored(src_fd, &mut read_bufs);
+                    let chunks = buf.chunks_mut(256 * 1024);
+                    let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
+                    let mut offset = start as u64;
+                    for chunk in chunks {
+                        let mut read_bufs = [IoSliceMut::new(chunk)];
+                        let sqe = sq.next_sqe().unwrap();
+                        sqe.offset = offset;
+                        sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-                    sq.submit_sqe();
+                        sq.submit_sqe();
 
-                    cq.wait_for_cqe()?;
-                    let cqe = cq.next_cqe().unwrap();
-                    ensure!(cqe.res as usize == end - start, "Failed to read the full range");
+                        cq.wait_for_cqe()?;
+                        let cqe = cq.next_cqe().unwrap();
+                        ensure!(cqe.res as usize == chunk.len(), "Failed to read the full range");
+                        offset += cqe.res as u64;
+                    }
                 }
                 #[cfg(not(feature = "io"))]
                 {

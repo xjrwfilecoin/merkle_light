@@ -286,7 +286,7 @@ impl<E: Element> Store<E> for DiskStore<E> {
         }
         #[cfg(feature = "io")]
         {
-            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
             let mut len = 0;
             let src_fd = reader.as_raw_fd();
             let dest_fd = self.file.as_raw_fd();
@@ -538,17 +538,24 @@ impl<E: Element> DiskStore<E> {
         #[cfg(feature = "io")]
         {
             let src_fd = self.file.as_raw_fd();
-            let mut read_bufs = [IoSliceMut::new(&mut read_data)];
-            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
-            let sqe = sq.next_sqe().unwrap();
-            sqe.offset = start as u64;
-            sqe.prep_read_vectored(src_fd, &mut read_bufs);
+            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
 
-            sq.submit_sqe();
+            let mut offset = start as u64;
 
-            cq.wait_for_cqe()?;
-            let cqe = cq.next_cqe().unwrap();
-            ensure!(cqe.res as usize == read_len, "Failed to read the full range");
+            let chunks = read_data.chunks_mut(256 * 1024);
+            for chunk in chunks {
+                let mut read_bufs = [IoSliceMut::new(chunk)];
+                let sqe = sq.next_sqe().unwrap();
+                sqe.offset = offset;
+                sqe.prep_read_vectored(src_fd, &mut read_bufs);
+
+                sq.submit_sqe();
+
+                cq.wait_for_cqe()?;
+                let cqe = cq.next_cqe().unwrap();
+                ensure!(cqe.res as usize == chunk.len(), "Failed to read the full range");
+                offset +=cqe.res as u64;
+            }
         }
 
         #[cfg(not(feature = "io"))]
@@ -569,22 +576,26 @@ impl<E: Element> DiskStore<E> {
     }
 
     pub fn store_read_into(&self, start: usize, end: usize, buf: &mut [u8]) -> Result<()> {
+        ensure!(buf.len() == end - start, "buf len is error");
         #[cfg(feature = "io")]
         {
             let src_fd = self.file.as_raw_fd();
-            let mut read_bufs = [IoSliceMut::new(buf)];
-            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
-            let sqe = sq.next_sqe().unwrap();
-            sqe.offset = start as u64;
-            sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-            sq.submit_sqe();
-
-            cq.wait_for_cqe()?;
-            let cqe = cq.next_cqe().unwrap();
-            ensure!(cqe.res as usize == buf.len(), "Failed to read the full range");
+            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
+            let chunks = buf.chunks_mut(256 * 1024);
+            let mut offset = start as u64;
+            for chunk in chunks {
+                let mut read_bufs = [IoSliceMut::new(chunk)];
+                let sqe = sq.next_sqe().unwrap();
+                sqe.offset = offset;
+                sqe.prep_read_vectored(src_fd, &mut read_bufs);
+                sq.submit_sqe();
+                cq.wait_for_cqe()?;
+                let cqe = cq.next_cqe().unwrap();
+                ensure!(cqe.res as usize == chunk.len(), "Failed to read the full range");
+                offset += cqe .res as u64;
+            }
         }
-
         #[cfg(not(feature = "io"))]
         {
             self.file
@@ -609,18 +620,21 @@ impl<E: Element> DiskStore<E> {
         );
         #[cfg(feature = "io")]
         {
-            let write_bufs = [IoSlice::new(slice)];
-            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
-            let sqe = sq.next_sqe().unwrap();
-            sqe.offset = start as u64;
-
-            let dest_fd = self.file.as_raw_fd();
-
-            sqe.prep_write_vectored(dest_fd, &write_bufs);
-            sq.submit_sqe();
-            cq.wait_for_cqe()?;
-            let cqe = cq.next_cqe().unwrap();
-            ensure!(cqe.res as usize == slice.len(), "Failed to write all at");
+            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
+            let chunks = slice.chunks(256 * 1024);
+            let mut offset = start as u64;
+            for chunk in chunks {
+                let write_bufs = [IoSlice::new(chunk)];
+                let sqe = sq.next_sqe().unwrap();
+                sqe.offset = offset;
+                let dest_fd = self.file.as_raw_fd();
+                sqe.prep_write_vectored(dest_fd, &write_bufs);
+                sq.submit_sqe();
+                cq.wait_for_cqe()?;
+                let cqe = cq.next_cqe().unwrap();
+                ensure!(cqe.res as usize == chunk.len(), "Failed to write all at");
+                offset += cqe.res as u64;
+            }
         }
 
         #[cfg(not(feature = "io"))]

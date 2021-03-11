@@ -610,7 +610,7 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         }
         #[cfg(feature = "io")]
         {
-            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
+            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
             let mut written = 0;
             let dest_fd = self.file.as_raw_fd();
             while written < store_size - len {
@@ -752,17 +752,24 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         #[cfg(feature = "io")]
         {
             let src_fd = self.file.as_raw_fd();
-            let mut read_bufs = [IoSliceMut::new(&mut read_data)];
-            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
-            let sqe = sq.next_sqe().unwrap();
-            sqe.offset = adjusted_start as u64;
-            sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-            sq.submit_sqe();
+            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
+            let chunks = read_data.chunks_mut(256 * 1024);
+            let mut offset = adjusted_start as u64;
+            for chunk in chunks {
+                let mut read_bufs = [IoSliceMut::new(chunk)];
+                let sqe = sq.next_sqe().unwrap();
+                sqe.offset = offset;
+                sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-            cq.wait_for_cqe()?;
-            let cqe = cq.next_cqe().unwrap();
-            ensure!(cqe.res as usize == read_len, "Failed to read at offset");
+                sq.submit_sqe();
+
+                cq.wait_for_cqe()?;
+                let cqe = cq.next_cqe().unwrap();
+                ensure!(cqe.res as usize == read_len, "Failed to read at offset");
+                offset += cqe.res as u64;
+
+            }
         }
         #[cfg(not(feature = "io"))]
         {
@@ -782,26 +789,34 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
     // This read is for internal use only during the 'build' process.
     fn store_read_range_internal(&self, start: usize, end: usize) -> Result<Vec<u8>> {
         let read_len = end - start;
-        let mut read_data = vec![0; read_len];
-
         ensure!(
             start <= self.data_width * self.elem_len || start >= self.cache_index_start,
             "out of bounds"
         );
+        let mut read_data = vec![0; read_len];
         #[cfg(feature = "io")]
         {
             let src_fd = self.file.as_raw_fd();
-            let mut read_bufs = [IoSliceMut::new(&mut read_data)];
-            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
-            let sqe = sq.next_sqe().unwrap();
-            sqe.offset = start as u64;
-            sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-            sq.submit_sqe();
 
-            cq.wait_for_cqe()?;
-            let cqe = cq.next_cqe().unwrap();
-            ensure!(cqe.res as usize == read_len, "Failed to read range");
+            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
+
+            let mut chunks = read_data.chunks_mut(256 * 1024);
+            let mut offset = start as u64;
+            for chunk in chunks {
+                let mut read_bufs = [IoSliceMut::new(chunk)];
+                let sqe = sq.next_sqe().unwrap();
+                sqe.offset = offset;
+                sqe.prep_read_vectored(src_fd, &mut read_bufs);
+
+                sq.submit_sqe();
+
+                cq.wait_for_cqe()?;
+                let cqe = cq.next_cqe().unwrap();
+                ensure!(cqe.res as usize == chunk.len(), "Failed to read range");
+                offset += cqe.res as u64;
+            }
+
         }
         #[cfg(not(feature = "io"))]
         {
@@ -889,17 +904,25 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
             #[cfg(feature = "io")]
             {
                 let src_fd = self.file.as_raw_fd();
-                let mut read_bufs = [IoSliceMut::new(buf)];
-                let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
-                let sqe = sq.next_sqe().unwrap();
-                sqe.offset = adjusted_start as u64;
-                sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-                sq.submit_sqe();
+                let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
 
-                cq.wait_for_cqe()?;
-                let cqe = cq.next_cqe().unwrap();
-                ensure!(cqe.res as usize == buf.len(), "Failed to read into");
+                let chunks = buf.chunks_mut(256 * 1024);
+                let mut offset = adjusted_start as u64;
+                for chunk in chunks {
+                    let mut read_bufs = [IoSliceMut::new(chunk)];
+                    let sqe = sq.next_sqe().unwrap();
+                    sqe.offset = offset;
+                    sqe.prep_read_vectored(src_fd, &mut read_bufs);
+
+                    sq.submit_sqe();
+
+                    cq.wait_for_cqe()?;
+                    let cqe = cq.next_cqe().unwrap();
+                    ensure!(cqe.res as usize == chunk.len(), "Failed to read into");
+                    offset += cqe.res as u64;
+                }
+
             }
             #[cfg(not(feature = "io"))]
             {
@@ -927,18 +950,24 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
 
         #[cfg(feature = "io")]
         {
-            let write_bufs = [IoSlice::new(slice)];
-            let (mut sq,mut cq) = uring::IoUring::with_entries(8).setup()?;
-            let sqe = sq.next_sqe().unwrap();
-            sqe.offset = start as u64;
 
+            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
+
+            let mut offset = start as u64;
+
+            let chunks = slice.chunks(256 * 1024);
             let dest_fd = self.file.as_raw_fd();
-
-            sqe.prep_write_vectored(dest_fd, &write_bufs);
-            sq.submit_sqe();
-            cq.wait_for_cqe()?;
-            let cqe = cq.next_cqe().unwrap();
-            ensure!(cqe.res as usize == slice.len(), "Failed to write all at");
+            for chunk in chunks {
+                let write_bufs = [IoSlice::new(chunk)];
+                let sqe = sq.next_sqe().unwrap();
+                sqe.offset = offset;
+                sqe.prep_write_vectored(dest_fd, &write_bufs);
+                sq.submit_sqe();
+                cq.wait_for_cqe()?;
+                let cqe = cq.next_cqe().unwrap();
+                ensure!(cqe.res as usize == chunk.len(), "Failed to write all at");
+                offset += cqe.res as u64;
+            }
         }
 
         #[cfg(not(feature = "io"))]
