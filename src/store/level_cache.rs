@@ -19,7 +19,7 @@ use log::trace;
 use crate::hash::Algorithm;
 
 #[cfg(feature = "io")]
-use uring::{SubmissionQueue,CompletionQueue};
+use io_uring::{IoUring, types, opcode, squeue};
 #[cfg(feature = "io")]
 use std::os::unix::io::AsRawFd;
 
@@ -610,21 +610,31 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         }
         #[cfg(feature = "io")]
         {
-            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
+            let mut uring = IoUring::new(8).expect("");
+            let (submitter,sq,cq) = uring.split();
             let mut written = 0;
             let dest_fd = self.file.as_raw_fd();
+            let dest_fd = types::Fd(dest_fd);
             while written < store_size - len {
-                let mut read_buf = [0; 256 * 1024];
+                let mut read_buf = [0; 1024 * 1024];
                 let len = reader.read(&mut read_buf)?;
-                let item = &read_buf[..len];
-                let write_bufs = [IoSlice::new(item)];
-                let sqe = sq.next_sqe().unwrap();
-                sqe.offset = written;
-                sqe.prep_write_vectored(dest_fd, &write_bufs);
-                sq.submit_sqe();
-                cq.wait_for_cqe()?;
-                let cqe = cq.next_cqe().unwrap();
-                written += cqe.res as u64;
+                let chunk = &read_buf[..len];
+
+                let write_e = opcode::Write::new(dest_fd,chunk.as_ptr(),chunk.len() as _);
+                unsafe {
+                    let mut queue = sq.available();
+                    let write_e = write_e.offset(written as i64).build().user_data(written).flags(squeue::Flags::IO_LINK);
+                    queue.push(write_e).ok().expect("");
+                }
+                let res = submitter.submit_and_wait(1)?;
+                assert_eq!(res,1);
+                let cqes = cq.available().collect::<Vec<_>>();
+                assert_eq!(cqes.len(),1);
+                assert_eq!(cqes[0].user_data(),written);
+                let ret_w = cqes[0].result();
+                assert_eq!(chunk.len() as i32,ret_w);
+
+                written += ret_w as u64;
             }
             self.file.set_len(written)?;
         }
@@ -752,22 +762,29 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         #[cfg(feature = "io")]
         {
             let src_fd = self.file.as_raw_fd();
+            let src_fd = types::Fd(src_fd);
+            let mut uring = IoUring::new(8).expect("");
+            let (submitter,sq,cq) = uring.split();
 
-            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
-            let chunks = read_data.chunks_mut(256 * 1024);
+            let chunks = read_data.chunks_mut(1024 * 1024);
             let mut offset = adjusted_start as u64;
             for chunk in chunks {
-                let mut read_bufs = [IoSliceMut::new(chunk)];
-                let sqe = sq.next_sqe().unwrap();
-                sqe.offset = offset;
-                sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-                sq.submit_sqe();
+                let read_e = opcode::Read::new(src_fd,chunk.as_mut_ptr(),chunk.len() as u32);
+                unsafe {
+                    let mut queue = sq.available();
+                    let read_e = read_e.offset(offset as i64).build().user_data(offset).flags(squeue::Flags::IO_LINK);
+                    queue.push(read_e).ok().expect("");
+                }
+                let res = submitter.submit_and_wait(1)?;
+                assert_eq!(res,1);
+                let cqes = cq.available().collect::<Vec<_>>();
+                assert_eq!(cqes.len(),1);
+                assert_eq!(cqes[0].user_data(),offset);
+                let ret = cqes[0].result();
 
-                cq.wait_for_cqe()?;
-                let cqe = cq.next_cqe().unwrap();
-                ensure!(cqe.res as usize == read_len, "Failed to read at offset");
-                offset += cqe.res as u64;
+                ensure!(ret as usize == chunk.len(), "Failed to read the full range");
+                offset += ret as u64;
 
             }
         }
@@ -797,24 +814,29 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         #[cfg(feature = "io")]
         {
             let src_fd = self.file.as_raw_fd();
+            let src_fd = types::Fd(src_fd);
+            let mut uring = IoUring::new(8).expect("");
+            let (submitter,sq,cq) = uring.split();
 
-
-            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
-
-            let mut chunks = read_data.chunks_mut(256 * 1024);
+            let mut chunks = read_data.chunks_mut(1024 * 1024);
             let mut offset = start as u64;
             for chunk in chunks {
-                let mut read_bufs = [IoSliceMut::new(chunk)];
-                let sqe = sq.next_sqe().unwrap();
-                sqe.offset = offset;
-                sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-                sq.submit_sqe();
+                let read_e = opcode::Read::new(src_fd,chunk.as_mut_ptr(),chunk.len() as _);
+                unsafe {
+                    let mut queue = sq.available();
+                    let read_e = read_e.offset(offset as i64).build().user_data(offset).flags(squeue::Flags::IO_LINK);
+                    queue.push(read_e).ok().expect("");
+                }
+                let res = submitter.submit_and_wait(1)?;
+                assert_eq!(res,1);
+                let cqes = cq.available().collect::<Vec<_>>();
+                assert_eq!(cqes.len(),1);
+                assert_eq!(cqes[0].user_data(),offset);
+                let ret = cqes[0].result();
 
-                cq.wait_for_cqe()?;
-                let cqe = cq.next_cqe().unwrap();
-                ensure!(cqe.res as usize == chunk.len(), "Failed to read range");
-                offset += cqe.res as u64;
+                ensure!(ret as usize == chunk.len(), "Failed to read the full range");
+                offset += ret as u64;
             }
 
         }
@@ -904,23 +926,31 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
             #[cfg(feature = "io")]
             {
                 let src_fd = self.file.as_raw_fd();
+                let src_fd = types::Fd(src_fd);
+                let mut uring = IoUring::new(8).expect("");
+                let (submitter,sq,cq) = uring.split();
 
-                let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
-
-                let chunks = buf.chunks_mut(256 * 1024);
+                let chunks = buf.chunks_mut(1024 * 1024);
                 let mut offset = adjusted_start as u64;
                 for chunk in chunks {
-                    let mut read_bufs = [IoSliceMut::new(chunk)];
-                    let sqe = sq.next_sqe().unwrap();
-                    sqe.offset = offset;
-                    sqe.prep_read_vectored(src_fd, &mut read_bufs);
 
-                    sq.submit_sqe();
 
-                    cq.wait_for_cqe()?;
-                    let cqe = cq.next_cqe().unwrap();
-                    ensure!(cqe.res as usize == chunk.len(), "Failed to read into");
-                    offset += cqe.res as u64;
+                    let read_e = opcode::Read::new(src_fd,chunk.as_mut_ptr(),chunk.len() as _);
+                    unsafe {
+                        let mut queue = sq.available();
+                        let read_e = read_e.offset(offset as i64).build().user_data(offset).flags(squeue::Flags::IO_LINK);
+                        queue.push(read_e).ok().expect("");
+                    }
+                    let res = submitter.submit_and_wait(1)?;
+                    assert_eq!(res,1);
+                    let cqes = cq.available().collect::<Vec<_>>();
+                    assert_eq!(cqes.len(),1);
+                    assert_eq!(cqes[0].user_data(),offset);
+                    let ret = cqes[0].result();
+
+                    ensure!(ret as usize == chunk.len(), "Failed to read the full range");
+                    offset += ret as u64;
+
                 }
 
             }
@@ -951,22 +981,31 @@ impl<E: Element, R: Read + Send + Sync> LevelCacheStore<E, R> {
         #[cfg(feature = "io")]
         {
 
-            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
+            let mut uring = IoUring::new(8).expect("");
+            let (submitter,sq,cq) = uring.split();
 
             let mut offset = start as u64;
 
-            let chunks = slice.chunks(256 * 1024);
-            let dest_fd = self.file.as_raw_fd();
+            let chunks = slice.chunks(1024 * 1024);
+            let fd = self.file.as_raw_fd();
+            let fd = types::Fd(fd);
             for chunk in chunks {
-                let write_bufs = [IoSlice::new(chunk)];
-                let sqe = sq.next_sqe().unwrap();
-                sqe.offset = offset;
-                sqe.prep_write_vectored(dest_fd, &write_bufs);
-                sq.submit_sqe();
-                cq.wait_for_cqe()?;
-                let cqe = cq.next_cqe().unwrap();
-                ensure!(cqe.res as usize == chunk.len(), "Failed to write all at");
-                offset += cqe.res as u64;
+
+                let write_e = opcode::Write::new(fd,chunk.as_ptr(),chunk.len() as _);
+                unsafe {
+                    let mut queue = sq.available();
+                    let write_e = write_e.offset(offset as i64).build().user_data(offset).flags(squeue::Flags::IO_LINK);
+                    queue.push(write_e).ok().expect("");
+                }
+                let res = submitter.submit_and_wait(1)?;
+                assert_eq!(res,1);
+                let cqes = cq.available().collect::<Vec<_>>();
+                assert_eq!(cqes.len(),1);
+                assert_eq!(cqes[0].user_data(),offset);
+                let ret_w = cqes[0].result();
+                assert_eq!(chunk.len() as i32,ret_w);
+                offset += ret_w as u64;
+
             }
         }
 

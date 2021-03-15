@@ -18,7 +18,7 @@ use typenum::marker_traits::Unsigned;
 use log::trace;
 use crate::hash::Algorithm;
 #[cfg(feature = "io")]
-use uring::{SubmissionQueue,CompletionQueue};
+use io_uring::{IoUring, types, opcode, squeue};
 #[cfg(feature = "io")]
 use std::os::unix::io::AsRawFd;
 
@@ -285,37 +285,55 @@ impl<E: Element> Store<E> for DiskStore<E> {
             self.file.seek(SeekFrom::Start(start))?;
         }
         #[cfg(feature = "io")]
-        {
-            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
+            let mut uring = IoUring::new(8).expect("");
+            let (submitter,sq,cq) = uring.split();
             let mut len = 0;
-            let src_fd = reader.as_raw_fd();
-            let dest_fd = self.file.as_raw_fd();
-            while len < cache_size {
-                let mut read_buf = [0; 256 * 1024];
-                let mut read_bufs = [IoSliceMut::new(&mut read_buf)];
+            let fd_in = reader.as_raw_fd();
+            let fd = self.file.as_raw_fd();
+            let fd_in = types::Fd(fd_in);
+            let fd = types::Fd(fd);
+            let file_size = self.len * self.elem_len;
+            loop {
+                let mut buf = vec![0_u8;1024 * 1024];
+                let buf = &mut buf[..];
+                let read_e = opcode::Read::new(fd_in,buf.as_mut_ptr(),buf.len() as _);
+                let off_t = cache_start as i64 + len;
+                unsafe {
+                    let mut queue = sq.available();
+                    let read_e = read_e.offset(off_t).build().user_data(off_t as u64).flags(squeue::Flags::IO_LINK);
+                    queue.push(read_e).ok().expect("");
+                }
+                let res = submitter.submit_and_wait(1)?;
+                assert_eq!(res, 1);
+                let cqes = cq.available().collect::<Vec<_>>();
+                assert_eq!(cqes.len(), 1);
+                assert_eq!(cqes[0].user_data(), off_t as u64);
+                let ret = cqes[0].result();
+                if ret <= 0 {
+                    break;
+                }
+                // let text = format!("{}:The quick brown fox jumps over the lazy dog.\r\n",x).into_bytes();
+                let buf = &buf[..ret as usize];
+                unsafe {
+                    let write_e = opcode::Write::new(fd, buf.as_ptr(), buf.len() as _);
+                    let mut queue = sq.available();
+                    let write_e = write_e.offset(off_t).build().user_data(off_t as u64).flags(squeue::Flags::IO_LINK);
+                    queue.push(write_e).ok().expect("");
+                }
 
-                let sqe = sq.next_sqe().unwrap();
-                sqe.offset = cache_start as u64 + len as u64;
-                sqe.prep_read_vectored(src_fd, &mut read_bufs);
-
-                sq.submit_sqe();
-
-                cq.wait_for_cqe()?;
-                let cqe = cq.next_cqe().unwrap();
-
-                let item = &read_buf[..cqe.res as usize];
-
-                let write_bufs = [IoSlice::new(item)];
-
-                let sqe = sq.next_sqe().unwrap();
-                sqe.offset = start + len as u64;
-                sqe.prep_write_vectored(dest_fd, &write_bufs);
-                sq.submit_sqe();
-                cq.wait_for_cqe()?;
-                let cqe = cq.next_cqe().unwrap();
-                len += cqe.res as usize;
+                let res = submitter.submit_and_wait(1)?;
+                assert_eq!(res, 1);
+                let cqes = cq.available().collect::<Vec<_>>();
+                assert_eq!(cqes.len(), 1);
+                assert_eq!(cqes[0].user_data(), off_t as u64);
+                let ret_w = cqes[0].result();
+                assert_eq!(ret, ret_w);
+                // println!("{}->{}",off_t,ret_w);
+                len += ret_w as i64;
+                if len >= file_size as i64 {
+                    break;
+                }
             }
-        }
 
 
         // Copy the data from the cached region to the writer.
@@ -387,7 +405,8 @@ impl<E: Element> Store<E> for DiskStore<E> {
         level: usize,
         read_start: usize,
         write_start: usize,
-    ) -> Result<()> {
+    ) -> Result<()>
+    {
         // Safety: this operation is safe becase it's a limited
         // writable region on the backing store managed by this type.
         let mut mmap = unsafe {
@@ -447,7 +466,8 @@ impl<E: Element> Store<E> for DiskStore<E> {
         leafs: usize,
         row_count: usize,
         _config: Option<StoreConfig>,
-    ) -> Result<E> {
+    ) -> Result<E>
+    {
         let branches = U::to_usize();
         ensure!(
             next_pow2(branches) == branches,
@@ -518,7 +538,8 @@ impl<E: Element> DiskStore<E> {
         store_range: usize,
         _branches: usize,
         config: &StoreConfig,
-    ) -> Result<bool> {
+    ) -> Result<bool>
+    {
         let data_path = StoreConfig::data_path(&config.path, &config.id);
 
         let file = File::open(&data_path)?;
@@ -538,23 +559,28 @@ impl<E: Element> DiskStore<E> {
         #[cfg(feature = "io")]
         {
             let src_fd = self.file.as_raw_fd();
-            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
+            let src_fd = types::Fd(src_fd);
+            let mut uring = IoUring::new(8).expect("");
+            let (submitter,sq,cq) = uring.split();
 
             let mut offset = start as u64;
-
-            let chunks = read_data.chunks_mut(256 * 1024);
+            let chunks = read_data.chunks_mut(1024 * 1024);
             for chunk in chunks {
-                let mut read_bufs = [IoSliceMut::new(chunk)];
-                let sqe = sq.next_sqe().unwrap();
-                sqe.offset = offset;
-                sqe.prep_read_vectored(src_fd, &mut read_bufs);
+                let read_e = opcode::Read::new(src_fd,chunk.as_mut_ptr(),chunk.len() as u32);
+                unsafe {
+                    let mut queue = sq.available();
+                    let read_e = read_e.offset(offset as i64).build().user_data(offset).flags(squeue::Flags::IO_LINK);
+                    queue.push(read_e).ok().expect("");
+                }
+                let res = submitter.submit_and_wait(1)?;
+                assert_eq!(res,1);
+                let cqes = cq.available().collect::<Vec<_>>();
+                assert_eq!(cqes.len(),1);
+                assert_eq!(cqes[0].user_data(),offset);
+                let ret = cqes[0].result();
 
-                sq.submit_sqe();
-
-                cq.wait_for_cqe()?;
-                let cqe = cq.next_cqe().unwrap();
-                ensure!(cqe.res as usize == chunk.len(), "Failed to read the full range");
-                offset +=cqe.res as u64;
+                ensure!(ret as usize == chunk.len(), "Failed to read the full range");
+                offset += ret as u64;
             }
         }
 
@@ -580,20 +606,27 @@ impl<E: Element> DiskStore<E> {
         #[cfg(feature = "io")]
         {
             let src_fd = self.file.as_raw_fd();
-
-            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
-            let chunks = buf.chunks_mut(256 * 1024);
+            let src_fd = types::Fd(src_fd);
+            let mut uring = IoUring::new(8).expect("");
+            let (submitter,sq,cq) = uring.split();
+            let chunks = buf.chunks_mut(1024 * 1024);
             let mut offset = start as u64;
             for chunk in chunks {
-                let mut read_bufs = [IoSliceMut::new(chunk)];
-                let sqe = sq.next_sqe().unwrap();
-                sqe.offset = offset;
-                sqe.prep_read_vectored(src_fd, &mut read_bufs);
-                sq.submit_sqe();
-                cq.wait_for_cqe()?;
-                let cqe = cq.next_cqe().unwrap();
-                ensure!(cqe.res as usize == chunk.len(), "Failed to read the full range");
-                offset += cqe .res as u64;
+                let read_e = opcode::Read::new(src_fd,chunk.as_mut_ptr(),chunk.len() as u32);
+                unsafe {
+                    let mut queue = sq.available();
+                    let read_e = read_e.offset(offset as i64).build().user_data(offset).flags(squeue::Flags::IO_LINK);
+                    queue.push(read_e).ok().expect("");
+                }
+                let res = submitter.submit_and_wait(1)?;
+                assert_eq!(res,1);
+                let cqes = cq.available().collect::<Vec<_>>();
+                assert_eq!(cqes.len(),1);
+                assert_eq!(cqes[0].user_data(),offset);
+                let ret = cqes[0].result();
+
+                ensure!(ret as usize == chunk.len(), "Failed to read the full range");
+                offset += ret as u64;
             }
         }
         #[cfg(not(feature = "io"))]
@@ -620,20 +653,27 @@ impl<E: Element> DiskStore<E> {
         );
         #[cfg(feature = "io")]
         {
-            let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
-            let chunks = slice.chunks(256 * 1024);
+            let mut uring = IoUring::new(8).expect("");
+            let (submitter,sq,cq) = uring.split();
+            let chunks = slice.chunks(1024 * 1024);
             let mut offset = start as u64;
+            let fd = self.file.as_raw_fd();
+            let fd = types::Fd(fd);
             for chunk in chunks {
-                let write_bufs = [IoSlice::new(chunk)];
-                let sqe = sq.next_sqe().unwrap();
-                sqe.offset = offset;
-                let dest_fd = self.file.as_raw_fd();
-                sqe.prep_write_vectored(dest_fd, &write_bufs);
-                sq.submit_sqe();
-                cq.wait_for_cqe()?;
-                let cqe = cq.next_cqe().unwrap();
-                ensure!(cqe.res as usize == chunk.len(), "Failed to write all at");
-                offset += cqe.res as u64;
+                let write_e = opcode::Write::new(fd,chunk.as_ptr(),chunk.len() as _);
+                unsafe {
+                    let mut queue = sq.available();
+                    let write_e = write_e.offset(offset as i64).build().user_data(offset).flags(squeue::Flags::IO_LINK);
+                    queue.push(write_e).ok().expect("");
+                }
+                let res = submitter.submit_and_wait(1)?;
+                assert_eq!(res,1);
+                let cqes = cq.available().collect::<Vec<_>>();
+                assert_eq!(cqes.len(),1);
+                assert_eq!(cqes[0].user_data(),offset);
+                let ret_w = cqes[0].result();
+                assert_eq!(chunk.len() as i32,ret_w);
+                offset += ret_w as u64;
             }
         }
 

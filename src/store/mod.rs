@@ -41,6 +41,10 @@ pub use level_cache::LevelCacheStore;
 pub use mmap::MmapStore;
 pub use vec::VecStore;
 
+#[cfg(feature = "io")]
+use io_uring::IoUring;
+use io_uring::{opcode, squeue, types};
+
 #[derive(Clone)]
 pub struct ExternalReader<R: Read + Send + Sync> {
     pub offset: usize,
@@ -65,21 +69,29 @@ impl ExternalReader<std::fs::File> {
                 #[cfg(feature = "io")]
                 {
                     let src_fd = reader.as_raw_fd();
-                    let chunks = buf.chunks_mut(256 * 1024);
-                    let (mut sq,mut cq) = uring::IoUring::with_entries(1).setup()?;
+                    let src_fd = types::Fd(src_fd);
+                    let chunks = buf.chunks_mut(1024 * 1024);
+                    let mut uring = IoUring::new(8).expect("");
+                    let (submitter,sq,cq) = uring.split();
+
                     let mut offset = start as u64;
                     for chunk in chunks {
-                        let mut read_bufs = [IoSliceMut::new(chunk)];
-                        let sqe = sq.next_sqe().unwrap();
-                        sqe.offset = offset;
-                        sqe.prep_read_vectored(src_fd, &mut read_bufs);
+                        let read_e = opcode::Read::new(src_fd,chunk.as_mut_ptr(),chunk.len() as _);
+                        unsafe {
+                            let mut queue = sq.available();
+                            let read_e = read_e.offset(offset as i64).build().user_data(offset).flags(squeue::Flags::IO_LINK);
+                            queue.push(read_e).ok().expect("");
+                        }
+                        let res = submitter.submit_and_wait(1)?;
+                        assert_eq!(res,1);
+                        let cqes = cq.available().collect::<Vec<_>>();
+                        assert_eq!(cqes.len(),1);
+                        assert_eq!(cqes[0].user_data(),offset);
+                        let ret = cqes[0].result();
 
-                        sq.submit_sqe();
+                        ensure!(ret as usize == chunk.len(), "Failed to read the full range");
+                        offset += ret as u64;
 
-                        cq.wait_for_cqe()?;
-                        let cqe = cq.next_cqe().unwrap();
-                        ensure!(cqe.res as usize == chunk.len(), "Failed to read the full range");
-                        offset += cqe.res as u64;
                     }
                 }
                 #[cfg(not(feature = "io"))]
